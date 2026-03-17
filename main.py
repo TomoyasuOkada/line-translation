@@ -23,12 +23,20 @@ from linebot.v3.webhooks import (
 import dotenv
 dotenv.load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-CHANEL_SECRET = os.getenv("CHANEL_SECRET")
+CHANNEL_SECRET = os.getenv("CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.getenv("CHANNEL_ACCESS_TOKEN")
+
+
+if not GEMINI_API_KEY:
+    raise ValueError("GEMINI_API_KEY is not set")
+if not CHANNEL_SECRET:
+    raise ValueError("CHANNEL_SECRET is not set")
+if not CHANNEL_ACCESS_TOKEN:
+    raise ValueError("CHANNEL_ACCESS_TOKEN is not set")
 
 app = Flask(__name__)
 configuration = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
-handler = WebhookHandler(CHANEL_SECRET)
+handler = WebhookHandler(CHANNEL_SECRET)
 client = genai.Client(api_key=GEMINI_API_KEY)
 
 
@@ -47,21 +55,26 @@ def callback():
     except InvalidSignatureError:
         app.logger.info("Invalid signature. Please check your channel access token/channel secret.")
         abort(400)
-
     return 'OK'
 
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event):
     with ApiClient(configuration) as api_client:
         line_bot_api = MessagingApi(api_client)
-        output_text = generate_content(event.message.text)
+        try:
+            output_text = generate_content(event.message.text)
+        except RuntimeError as e:
+            app.logger.warning(f"Gemini error: {e}")
+            output_text = "翻訳に失敗しました。少し待ってからもう一度試してください。"
+        except Exception as e:
+            app.logger.exception(f"Unexpected error in handle_message: {e}")
+            output_text = "内部エラーが発生しました。"
         line_bot_api.reply_message_with_http_info(
             ReplyMessageRequest(
                 reply_token=event.reply_token,
                 messages=[TextMessage(text=output_text)]
             )
         )
-
 
 def generate_content(input_text: str) -> str:
     response = client.models.generate_content(
@@ -77,5 +90,4 @@ def generate_content(input_text: str) -> str:
 
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 5001))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(debug=True, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
