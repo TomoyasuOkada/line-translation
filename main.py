@@ -57,18 +57,22 @@ def callback():
         abort(400)
     return 'OK'
 
+#message eventかつテキストメッセージイベントのときにhandle_message関数を呼び出す
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event):
     with ApiClient(configuration) as api_client:
         line_bot_api = MessagingApi(api_client)
         try:
-            output_text = generate_content(event.message.text)
+            if event.message.text.startswith("https://") or event.message.text.startswith("http://"):
+                pass
+            else:
+                output_text = generate_content(event.message.text)
         except RuntimeError as e:
             app.logger.warning(f"Gemini error: {e}")
-            output_text = "翻訳に失敗しました。少し待ってからもう一度試してください。"
+            output_text = "Failed to generate content. Please try again later."
         except Exception as e:
-            app.logger.exception(f"Unexpected error in handle_message: {e}")
-            output_text = "内部エラーが発生しました。"
+            app.logger.exception(f"Unexpected error in handle_message: {type(e).__name__}: {e}")
+            output_text = "An unexpected error occurred."
         line_bot_api.reply_message_with_http_info(
             ReplyMessageRequest(
                 reply_token=event.reply_token,
@@ -76,9 +80,9 @@ def handle_message(event):
             )
         )
 
-def generate_content(input_text: str) -> str:
+def generate_content(input_text: str) -> str:        
     response = client.models.generate_content(
-        model="gemini-3.1-flash-lite-preview",
+        model="gemini-2.5-flash-lite",
         config=types.GenerateContentConfig(
             system_instruction="If the user's input is in Japanese, translate it into natural English. If the user's input is in English, translate it into natural Japanese. "
             "Do not provide alternatives. "
