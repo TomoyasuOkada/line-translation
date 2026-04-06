@@ -23,6 +23,9 @@ from linebot.v3.webhooks import (
     MessageEvent,
     TextMessageContent
 )
+from google.cloud import tasks_v2
+import json
+
 import dotenv
 dotenv.load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -43,6 +46,7 @@ handler = WebhookHandler(CHANNEL_SECRET)
 client = genai.Client(api_key=GEMINI_API_KEY)
 firebase_app = firebase_admin.initialize_app()
 db = firestore.client()
+cloud_tasks_client = tasks_v2.CloudTasksClient()
 
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -61,31 +65,80 @@ def callback():
         abort(400)
     return 'OK'
 
-#message eventかつテキストメッセージイベントのときにhandle_message関数を呼び出す
+#LINEからメッセージイベントを受け取ったときにCloud Tasksにタスクを追加する
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event):
+    enqueue_task(event)
+
+
+@app.route("/worker", methods=['POST'])
+def worker():
+    data = request.get_json()
+    try:
+        process_message_from_payload(data)
+    except Exception as e:
+        app.logger.exception(f"Unhandled error in worker: {type(e).__name__}: {e}")
+    return 'OK'
+
+def enqueue_task(event):
+    project = os.getenv("PROJECT_ID")
+    location = os.getenv("LOCATION_ID")
+    queue = os.getenv("QUEUE_ID")
+
+    payload = {
+        "text": event.message.text,
+        "reply_token": event.reply_token,
+        "webhook_event_id": event.webhook_event_id,
+        "timestamp": event.timestamp,
+        "is_redelivery": event.delivery_context.is_redelivery,
+        "source_type": event.source.type,
+        "user_id": getattr(event.source, "user_id", None),
+        "group_id": getattr(event.source, "group_id", None),
+        "room_id": getattr(event.source, "room_id", None),
+    }
+    task = tasks_v2.Task(
+        http_request=tasks_v2.HttpRequest(
+            http_method=tasks_v2.HttpMethod.POST,
+            url=os.getenv("SERVICE_URL") + "/worker",
+            headers={"Content-Type": "application/json"},
+            oidc_token=tasks_v2.OidcToken(
+                service_account_email=os.getenv("SERVICE_ACCOUNT_EMAIL"),
+                audience=os.getenv("SERVICE_URL"),
+            ),
+            body=json.dumps(payload).encode(),
+        ),
+    )
+    parent = cloud_tasks_client.queue_path(project, location, queue)
+    try:
+        cloud_tasks_client.create_task(parent=parent, task=task)
+    except Exception as e:
+        app.logger.exception(f"Failed to enqueue task: {type(e).__name__}: {e}")
+    
+
+def process_message_from_payload(payload):
     with ApiClient(configuration) as api_client:
         line_bot_api = MessagingApi(api_client)
         try:
             #ULRのスキップ
-            if event.message.text.startswith("https://") or event.message.text.startswith("http://"):
+            if payload["text"].startswith("https://") or payload["text"].startswith("http://"):
                 return
             else:
-                user_id = getattr(event.source, "user_id", None)
-                group_id = getattr(event.source, "group_id", None)
-                room_id = getattr(event.source, "room_id", None)
+                user_id = payload.get("user_id")
+                group_id = payload.get("group_id")
+                room_id = payload.get("room_id")
                 users, messages = store_and_get_message(
                     user_id=user_id,
                     group_id=group_id,
                     room_id=room_id,
-                    input_text=event.message.text,
-                    reply_token=event.reply_token,
-                    webhook_event_id=event.webhook_event_id,
-                    type=event.source.type,
-                    timestamp=event.timestamp
+                    input_text=payload["text"],
+                    reply_token=payload["reply_token"],
+                    webhook_event_id=payload["webhook_event_id"],
+                    type=payload["source_type"],
+                    timestamp=payload["timestamp"],
+                    flag=payload.get("is_redelivery", False)
                 )
-                output_text = generate_content(event.message.text, users, messages)
-                
+                output_text = generate_content(payload["text"], users, messages)
+
         except RuntimeError as e:
             app.logger.warning(f"Gemini error: {e}")
             output_text = "Failed to generate content. Please try again later."
@@ -94,7 +147,7 @@ def handle_message(event):
             output_text = "An unexpected error occurred."
         line_bot_api.reply_message_with_http_info(
             ReplyMessageRequest(
-                reply_token=event.reply_token,
+                reply_token=payload["reply_token"],
                 messages=[TextMessage(text=output_text)]
             )
         )
@@ -124,7 +177,7 @@ def handle_member_joined(event):
                     )
                     names.append(profile.display_name)
             text= ", ".join(names)
-            welcome_message = f"Welcome to the group! グループへようこそ！ {text}!"
+            welcome_message = f"Welcome to the group! {text} !"
             line_bot_api.reply_message_with_http_info(
                 ReplyMessageRequest(
                     reply_token=event.reply_token,
@@ -161,7 +214,7 @@ def generate_content(input_text: str, users: list, messages: list) -> str:
     return response.text
 
 #Firestoreにメッセージを保存する関数
-def store_and_get_message(user_id: str, group_id: str, room_id: str, input_text: str, reply_token: str, webhook_event_id: str, type: str, timestamp: int):
+def store_and_get_message(user_id: str, group_id: str, room_id: str, input_text: str, reply_token: str, webhook_event_id: str, type: str, timestamp: int, flag: bool):
     collection_ref=db.collection("events")
     #送信元がグループの場合
     if type=="group":
@@ -172,35 +225,30 @@ def store_and_get_message(user_id: str, group_id: str, room_id: str, input_text:
     #トークルームの場合
     else:
         docs = collection_ref.where(filter=FieldFilter("roomId", "==", room_id))
-    docs_list = docs.get()
+    docs_list = docs.order_by("timestamp").get()
     #ドキュメントの数がMAX_CONTENT_LENGTHを超えている場合、最も古いドキュメントを削除する
     if len(docs_list) > MAX_CONTENT_LENGTH:
-        #ドキュメントの一番古いものを取得
-        oldest_doc = docs.order_by("timestamp").limit(1).get()
-        oldest_doc_id = oldest_doc[0].id
-        db.collection("events").document(oldest_doc_id).delete()
-    docs=docs.order_by("timestamp").get()
+        db.collection("events").document(docs_list[0].id).delete()
+        docs_list = docs_list[1:]
     messages = []
     users= []
-    for doc in docs:
+    for doc in docs_list:
         messages.append(doc.to_dict()["text"])
         users.append(doc.to_dict()["userId"])
-    collection_ref.add({
-        "userId": user_id,
-        "groupId": group_id,
-        "text": input_text,
-        "replyToken": reply_token,
-        "webhookEventId": webhook_event_id,
-        "type": type,
-        "timestamp": timestamp,
-        "roomId": room_id
-    })
+    if not flag:
+        collection_ref.add({
+            "userId": user_id,
+            "groupId": group_id,
+            "text": input_text,
+            "replyToken": reply_token,
+            "webhookEventId": webhook_event_id,
+            "type": type,
+            "timestamp": timestamp,
+            "roomId": room_id
+        })
     return users, messages
         
-#getをするとリストになる。リストに対してgetは呼べない。
-
     
 if __name__ == "__main__":
     app.run(debug=True, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
     
-
