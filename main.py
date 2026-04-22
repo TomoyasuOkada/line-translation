@@ -1,54 +1,86 @@
+# --- 標準ライブラリ ---
 import os
-import httpx
-from google import genai
-from google.genai import types
-from flask import Flask, request, abort
-import firebase_admin
-from firebase_admin import firestore
-from google.cloud.firestore import FieldFilter
-from linebot.v3 import (
-    WebhookHandler
-)
-from linebot.v3.exceptions import (
-    InvalidSignatureError
-)
-from linebot.v3.messaging import (
-    Configuration,
-    ApiClient,
-    MessagingApi,
-    ReplyMessageRequest,
-    TextMessage
-)
-from linebot.v3.webhooks import (
-    MemberJoinedEvent,
-    MessageEvent,
-    TextMessageContent
-)
-from google.cloud import tasks_v2
-from google.api_core.exceptions import AlreadyExists
 import json
 
-import dotenv
+# --- Web フレームワーク ---
+from flask import Flask, request, abort
+
+# --- LINE Messaging API SDK (v3) ---
+from linebot.v3 import WebhookHandler
+from linebot.v3.exceptions import InvalidSignatureError
+from linebot.v3.messaging import (
+    Configuration, ApiClient, MessagingApi,
+    ReplyMessageRequest, TextMessage,
+)
+from linebot.v3.webhooks import (
+    MessageEvent, MemberJoinedEvent, TextMessageContent,
+)
+
+# --- Gemini API  ---
+from google import genai
+from google.genai import types
+
+# --- Google Cloud ---
+from google.cloud.firestore import FieldFilter
+from google.cloud import tasks_v2
+from google.cloud import firestore
+from google.api_core.exceptions import AlreadyExists
+from google.oauth2 import id_token
+from google.auth.transport import requests as google_auth_requests
+# --- その他 ---
+import httpx           
+import dotenv          
+
+import time
+
+
 dotenv.load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 CHANNEL_SECRET = os.getenv("CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.getenv("CHANNEL_ACCESS_TOKEN")
+EXPECTED_AUDIENCE = os.getenv("SERVICE_URL")
+EXPECTED_SA_EMAIL = os.getenv("SERVICE_ACCOUNT_EMAIL")
 MAX_CONTENT_LENGTH = 10
-
-if not GEMINI_API_KEY:
-    raise ValueError("GEMINI_API_KEY is not set")
-if not CHANNEL_SECRET:
-    raise ValueError("CHANNEL_SECRET is not set")
-if not CHANNEL_ACCESS_TOKEN:
-    raise ValueError("CHANNEL_ACCESS_TOKEN is not set")
 
 app = Flask(__name__)
 configuration = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(CHANNEL_SECRET)
 client = genai.Client(api_key=GEMINI_API_KEY)
-firebase_app = firebase_admin.initialize_app()
-db = firestore.client()
+db = firestore.Client(project=os.getenv("PROJECT_ID"))
 cloud_tasks_client = tasks_v2.CloudTasksClient()
+auth_request = google_auth_requests.Request()
+
+import logging
+app.logger.setLevel(logging.INFO)
+def verify_oidc_token():
+    auth_header = request.headers.get("Authorization")
+    if not auth_header:
+        app.logger.warning("Missing Authorization header")
+        abort(401)
+    # Split the auth type and value from the header.
+    auth_type, token = auth_header.split(" ", 1)
+    if auth_type.lower() == "bearer":
+        try:
+            claims = id_token.verify_oauth2_token(
+                token,
+                auth_request,
+                audience=EXPECTED_AUDIENCE,
+            )
+        except ValueError as e:
+            app.logger.warning(f"Invalid OIDC token: {e}")
+            abort(401)
+        if not claims.get("email_verified"):
+            app.logger.warning("email_verified is false")
+            abort(403)
+        if claims.get("email") != EXPECTED_SA_EMAIL:
+            app.logger.warning(
+                f"Unexpected SA: got {claims.get('email')}, "
+                f"expected {EXPECTED_SA_EMAIL}"
+            )
+            abort(403)
+    else:
+        app.logger.warning(f"Unsupported auth type: {auth_type}")
+        abort(401)
 
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -109,14 +141,19 @@ def enqueue_task(event):
         app.logger.exception(f"Failed to enqueue task: {type(e).__name__}: {e}")
 
 #翻訳リクエスト受け取り
+
 @app.route("/worker", methods=['POST'])
 def worker():
+    verify_oidc_token()
     data = request.get_json()
+    
     try:
         process_message_from_payload(data)
     except Exception as e:
         app.logger.exception(f"Unhandled error in worker: {type(e).__name__}: {e}")
     return 'OK'
+
+
 
 def process_message_from_payload(payload):
     with ApiClient(configuration) as api_client:
@@ -288,7 +325,7 @@ def handle_member_joined(event):
                     )
                     names.append(profile.display_name)
             text= ", ".join(names)
-            welcome_message = f"Welcome to the group　! {text} !"
+            welcome_message = f"Welcome to the group! {text}!"
             line_bot_api.reply_message_with_http_info(
                 ReplyMessageRequest(
                     reply_token=event.reply_token,
