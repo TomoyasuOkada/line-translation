@@ -27,12 +27,8 @@ from google.cloud import firestore
 from google.api_core.exceptions import AlreadyExists
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_auth_requests
-# --- その他 ---
-import httpx           
+# --- その他 ---        
 import dotenv          
-
-import time
-
 
 dotenv.load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -189,9 +185,6 @@ def process_message_from_payload(payload):
                     return
                 try:
                     output_text = generate_content(user_id,payload["text"], users, messages)
-                except httpx.TimeoutException as e:
-                    app.logger.exception(f"Timeout error generating content: {type(e).__name__}: {e}")
-                    output_text = "Gemini API request timed out."
                 except Exception as e:
                     app.logger.exception(f"Error generating content: {type(e).__name__}: {e}")
                     output_text = "Gemini API error occurred."
@@ -254,7 +247,7 @@ def generate_content(user_id: str, input_text: str, users: list, messages: list)
                 retry_options=types.HttpRetryOptions(
                     attempts=1,
                 ),
-                timeout=20_000,  # 20秒
+                timeout=50_000,  
             ),
         ),
         contents=prompt,    
